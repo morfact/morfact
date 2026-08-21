@@ -46,6 +46,7 @@ createEngine({ store, plugins })
         │  claim → run hook → commit / suspend
         ▼
    succeeded | waiting (human / child run / external poll)
+   continue  (same task, next iteration; downstream stays locked)
 ```
 
 | Term | Meaning |
@@ -274,6 +275,7 @@ Template expressions:
 | `@morfact/core/join` | `join` | Pass-through once inbound dependencies are cleared |
 | `@morfact/core/gate` | `gate` | Waits for humans while `interaction.schema.required` is missing, and calls `createInteraction` |
 | `@morfact/core/completed` | `completed` | Terminal marker |
+| `@morfact/core/loop` | `loop` | Runs one body hook per iteration on the **same** task. Re-queues via `commitTaskContinue`; does not add graph cycles |
 
 ### 6.1 Gate (human confirmation)
 
@@ -340,6 +342,34 @@ createEngine({ store, plugins, childTemplateRegistry });
 ```
 
 You can skip the file and pass an object: `{ aliases, overrides, conventionTemplateNamePrefix, defaultsVersion }`.
+
+### 6.3 Loop (unknown-N iteration)
+
+Use a loop when N is not known at compile time (pagination, agent turns). It is **one task / one `logicalKey`**, not N coordinator subtasks and not a graph back-edge. `compileFlow` still rejects cycles.
+
+YAML:
+
+```yaml
+- id: paginate
+  type: loop
+  loop:
+    body: book.paginate_page@1
+    maxIterations: 500
+    onMaxIterations: fail   # default; use succeed when a cap is a valid stop
+```
+
+The body hook receives `input.loop = { iteration, checkpoint }` and must return:
+
+```ts
+{ halt: false, checkpoint, output? }  // next round; checkpoint is opaque to the engine
+{ halt: true, output?, checkpoint? }  // node completes
+```
+
+Throw retries the **same** iteration through existing `maxAttempts`. The next iteration starts only after `{ halt: false, checkpoint }`.
+
+`maxIterations` is a budget, not a correctness signal. Default `onMaxIterations: fail` is a fuse. Precision / agent flows that may legally stop at the cap should set `succeed`. Final output always includes `haltReason` (`halt` | `max_iterations`) and `truncated` when the cap was hit.
+
+This is not polling: each continue is a real commit of progress, the node stays incomplete, and the engine re-enqueues **the same task**. Do not reuse `completePollingTask`. Production stores must implement `commitTaskContinue` (re-queue, persist `meta.loopState`, do **not** unlock downstream).
 
 ---
 
@@ -417,9 +447,10 @@ for (const testCase of storeConformanceCases) {
 |---|---|
 | 24 required methods | Run / Task / Outbox / Interaction |
 | `appendTasks?` | Required for `@morfact/core/coordinator`; missing it throws `StoreProtocolError` |
+| `commitTaskContinue?` | Required for `@morfact/core/loop`; re-queue the same task and persist checkpoint; must not unlock downstream |
 | `listRuns({ parentTaskId })` | Used by spawn to find an existing child run |
 
-For local/tests, use `new MemoryWorkflowStateStore()`. It already implements `appendTasks`, parent/child runs, and merging `input` on resume.
+For local/tests, use `new MemoryWorkflowStateStore()`. It already implements `appendTasks`, `commitTaskContinue`, parent/child runs, and merging `input` on resume.
 
 ---
 

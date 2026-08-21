@@ -62,6 +62,33 @@ export function validateFlowDefinition(
   for (const node of nodes) {
     if (node.type === 'completed') continue;
     if (node.type === 'join') continue; // join is a built-in passthrough
+    if (node.type === 'loop') {
+      if (!availableHooks.has('@morfact/core/loop')) {
+        throw new WorkflowValidationError(
+          `Flow node ${node.id} references missing hook: @morfact/core/loop`,
+        );
+      }
+      if (!node.loop?.body) {
+        throw new WorkflowValidationError(
+          `Flow node ${node.id}: loop.body is required`,
+        );
+      }
+      if (!availableHooks.has(node.loop.body)) {
+        throw new WorkflowValidationError(
+          `Flow node ${node.id} references missing loop body hook: ${node.loop.body}`,
+        );
+      }
+      if (
+        typeof node.loop.maxIterations !== 'number' ||
+        !Number.isFinite(node.loop.maxIterations) ||
+        node.loop.maxIterations < 1
+      ) {
+        throw new WorkflowValidationError(
+          `Flow node ${node.id}: loop.maxIterations must be >= 1`,
+        );
+      }
+      continue;
+    }
     const executor = typeof node.hooks?.executor === 'string'
       ? node.hooks.executor
       : node.hooks?.executor?.use;
@@ -324,6 +351,7 @@ function resolveHook(node: FlowNodeDefinition): string {
   if (node.type === 'completed') return '@morfact/core/completed';
   if (node.type === 'coordinator') return '@morfact/core/coordinator';
   if (node.type === 'spawn') return '@morfact/core/spawn';
+  if (node.type === 'loop') return '@morfact/core/loop';
   if (typeof node.hooks?.executor === 'string') return node.hooks.executor;
   if (node.hooks?.executor?.use) return node.hooks.executor.use;
   throw new Error(`Node ${node.id}: hooks.executor is required`);
@@ -364,6 +392,7 @@ function expandNode(
     ...(node.join && { join: node.join }),
     ...(node.spawn && { spawn: node.spawn }),
     ...(coordinatorMeta && { coordinator: coordinatorMeta }),
+    ...(node.loop && { loop: node.loop }),
     ...(node.meta ?? {}),
     ...(node.inputTemplate && { inputTemplate: node.inputTemplate }),
   };

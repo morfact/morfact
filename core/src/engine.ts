@@ -7,6 +7,7 @@ import type {
   HookDefinition,
   ListRunsFilter,
   StartRunCommand,
+  TaskRun,
   WorkflowDefinition,
 } from './contracts.js';
 import {
@@ -24,6 +25,7 @@ import { gateHook } from './hooks/gate.js';
 import { completedHook } from './hooks/completed.js';
 import { coordinatorHook } from './hooks/coordinator.js';
 import { createSpawnHook } from './hooks/spawn.js';
+import { createLoopHook } from './hooks/loop.js';
 import {
   createBuiltinRuntimeServices,
   mergeEngineServices,
@@ -36,6 +38,28 @@ function workflowKey(name: string, version: string): string {
 
 function defaultIdGenerator(): string {
   return crypto.randomUUID();
+}
+
+function withLoopRuntime(
+  input: Record<string, unknown>,
+  task: Pick<TaskRun, 'meta'>,
+): Record<string, unknown> {
+  const loopState = task.meta?.['loopState'];
+  if (!loopState || typeof loopState !== 'object' || Array.isArray(loopState)) {
+    return input;
+  }
+  const state = loopState as Record<string, unknown>;
+  const iteration =
+    typeof state.iteration === 'number' && Number.isFinite(state.iteration)
+      ? state.iteration
+      : 0;
+  return {
+    ...input,
+    loop:
+      state.checkpoint !== undefined
+        ? { iteration, checkpoint: state.checkpoint }
+        : { iteration },
+  };
 }
 
 function installUnique<T>(
@@ -69,6 +93,7 @@ export function createEngine(options: EngineOptions): Engine {
     completedHook,
     coordinatorHook,
     createSpawnHook(options.childTemplateRegistry),
+    createLoopHook(hooks),
   ];
 
   for (const hook of builtinHooks) {
@@ -133,6 +158,19 @@ export function createEngine(options: EngineOptions): Engine {
     let result;
     try {
       try {
+        const resolved = resolveWorkflowTaskInput(
+          claimed.task.input,
+          claimed.run,
+        );
+        const hookInput =
+          resolved &&
+          typeof resolved === 'object' &&
+          !Array.isArray(resolved)
+            ? withLoopRuntime(
+                resolved as Record<string, unknown>,
+                claimed.task,
+              )
+            : resolved;
         result = await hook.execute(
           {
             run: {
@@ -153,7 +191,7 @@ export function createEngine(options: EngineOptions): Engine {
             signal: command.signal ?? new AbortController().signal,
             now,
           },
-          resolveWorkflowTaskInput(claimed.task.input, claimed.run),
+          hookInput,
         );
       } catch (error) {
         await options.store.commitTaskFailure({
@@ -222,6 +260,33 @@ export function createEngine(options: EngineOptions): Engine {
         taskId: claimed.task.id,
         runId: claimed.run.id,
         status: 'waiting',
+      };
+    }
+
+    if (result.status === 'continue') {
+      if (typeof options.store.commitTaskContinue !== 'function') {
+        throw new StoreProtocolError(
+          'Store does not implement commitTaskContinue (required by @morfact/core/loop)',
+        );
+      }
+      if (claimed.task.leaseToken === undefined) {
+        throw new StoreProtocolError(
+          'Claimed task is missing a lease token; cannot commit continue',
+        );
+      }
+      await options.store.commitTaskContinue({
+        commandId: createId(),
+        taskId: claimed.task.id,
+        leaseToken: claimed.task.leaseToken,
+        checkpoint: result.checkpoint,
+        iteration: result.iteration,
+        ...(result.output === undefined ? {} : { output: result.output }),
+        now: now(),
+      });
+      return {
+        taskId: claimed.task.id,
+        runId: claimed.run.id,
+        status: 'continue',
       };
     }
 

@@ -27,6 +27,7 @@ Implements protocol v1 claim / lease heartbeat / DAG unblocking, plus:
 - `createChildRun` (writes `parentTaskId` / `parentRunId` / `rootRunId`)
 - `listRuns({ parentTaskId })`
 - `appendTasks` (required by `@morfact/core/coordinator`)
+- `commitTaskContinue` (required by `@morfact/core/loop`; re-queues the same task, does not unlock downstream)
 - `resumeTask` sets the task to `ready` and merges `input`
 
 For hooks, YAML, gates, spawn, outbox, and Store contracts, see the [`@morfact/core` README](../core/README.md).

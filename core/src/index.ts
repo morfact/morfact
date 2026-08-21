@@ -64,6 +64,7 @@ export type {
   JoinConfig,
   SpawnConfig,
   CoordinatorConfig,
+  LoopConfig,
   ExpandConfig,
   FlowNodeDefinition,
   FlowEdge,
@@ -95,6 +96,13 @@ export type {
 export { spawnHook, createSpawnHook } from './hooks/spawn.js';
 export type { SpawnServices, SpawnOutput } from './hooks/spawn.js';
 
+export { createLoopHook } from './hooks/loop.js';
+export type {
+  LoopRuntimeInput,
+  LoopBodyOutput,
+  LoopOutput,
+} from './hooks/loop.js';
+
 // ─── Core contracts ───────────────────────────────────────────────────────
 
 export type {
@@ -105,6 +113,7 @@ export type {
   ClaimOutboxCommand,
   CommitTaskFailureCommand,
   CommitTaskSuccessCommand,
+  CommitTaskContinueCommand,
   CompletePollingTaskCommand,
   CreateChildRunCommand,
   AppendTasksCommand,

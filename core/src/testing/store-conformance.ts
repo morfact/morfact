@@ -746,6 +746,70 @@ export const storeConformanceCases: readonly StoreConformanceCase[] = [
     },
   },
   {
+    name: 're-queues the same task on continue without unlocking downstream',
+    async run(createStore) {
+      const store = await createStore();
+      if (typeof store.commitTaskContinue !== 'function') {
+        return;
+      }
+      await store.createRun(
+        runCommand('continue', [
+          {
+            id: 'conformance-task-loop',
+            logicalKey: 'loop',
+            hook: 'conformance.loop@1',
+            input: {},
+            dependsOn: [],
+            maxAttempts: 3,
+          },
+          {
+            id: 'conformance-task-after',
+            logicalKey: 'after',
+            hook: 'conformance.noop@1',
+            input: {},
+            dependsOn: ['loop'],
+            maxAttempts: 1,
+          },
+        ]),
+      );
+      const claim = await store.claimTask({
+        workerId: 'worker',
+        taskId: 'conformance-task-loop',
+        now: new Date('2026-01-01T00:00:01.000Z'),
+        leaseExpiresAt: new Date('2026-01-01T00:01:01.000Z'),
+      });
+      assert(claim, 'loop task must be claimable');
+      assert(claim.task.leaseToken, 'claimed task must have a lease token');
+      await store.commitTaskContinue({
+        commandId: 'conformance-continue',
+        taskId: claim.task.id,
+        leaseToken: claim.task.leaseToken,
+        checkpoint: { cursor: 1 },
+        iteration: 1,
+        output: { cursor: 0 },
+        now: new Date('2026-01-01T00:00:02.000Z'),
+      });
+      const looped = await store.getTask('conformance-task-loop');
+      assert(looped?.status === 'ready', 'continued task must be ready again');
+      assert(
+        (looped.meta?.loopState as { iteration?: number })?.iteration === 1,
+        'continue must persist loopState.iteration',
+      );
+      const after = await store.getTask('conformance-task-after');
+      assert(
+        after?.status === 'pending',
+        'continue must not unlock downstream tasks',
+      );
+      const again = await store.claimTask({
+        workerId: 'worker',
+        taskId: 'conformance-task-loop',
+        now: new Date('2026-01-01T00:00:03.000Z'),
+        leaseExpiresAt: new Date('2026-01-01T00:01:03.000Z'),
+      });
+      assert(again, 'continued task must be claimable again');
+    },
+  },
+  {
     name: 'lists runs with filters and pagination',
     async run(createStore) {
       const store = await createStore();

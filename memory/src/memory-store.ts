@@ -6,6 +6,7 @@ import type {
   ClaimTaskCommand,
   CommitTaskFailureCommand,
   CommitTaskSuccessCommand,
+  CommitTaskContinueCommand,
   CompletePollingTaskCommand,
   CreateChildRunCommand,
   CreateInteractionCommand,
@@ -192,6 +193,37 @@ export class MemoryWorkflowStateStore implements WorkflowStateStore {
       this.runs.set(run.id, { ...run, status: runStatus as WorkflowRunStatus, updatedAt: command.now });
     }
     return { taskId: task.id, taskStatus: 'failed', runStatus, unlockedTaskIds: [], replayed: false };
+  }
+
+  async commitTaskContinue(command: CommitTaskContinueCommand): Promise<TaskCommitResult> {
+    const task = this.tasks.get(command.taskId);
+    if (!task) throw new Error(`Task not found: ${command.taskId}`);
+    const continued: TaskRun = {
+      ...task,
+      status: 'ready',
+      attempt: 0,
+      ...(command.output !== undefined ? { output: command.output } : {}),
+      meta: {
+        ...(task.meta ?? {}),
+        loopState: {
+          iteration: command.iteration,
+          checkpoint: command.checkpoint,
+        },
+      },
+      updatedAt: command.now,
+    };
+    this.tasks.set(task.id, continued);
+    const run = this.runs.get(task.runId);
+    if (run && run.status !== 'running') {
+      this.runs.set(run.id, { ...run, status: 'running', updatedAt: command.now });
+    }
+    return {
+      taskId: task.id,
+      taskStatus: 'ready',
+      runStatus: 'running',
+      unlockedTaskIds: [],
+      replayed: false,
+    };
   }
 
   async suspendTask(command: SuspendTaskCommand): Promise<TaskCommitResult> {

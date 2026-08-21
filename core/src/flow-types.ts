@@ -13,6 +13,7 @@ export type FlowNodeType =
   | 'router'
   | 'spawn'
   | 'join'
+  | 'loop'
   | 'completed';
 
 export interface RetryPolicy {
@@ -71,6 +72,19 @@ export interface CoordinatorConfig {
   taskGroupTemplateSpec?: { tasks: FlowSubtaskTemplate[] };
 }
 
+export interface LoopConfig {
+  /** Hook name invoked once per iteration. */
+  body: string;
+  /** Budget: maximum body executions. Not a correctness signal. */
+  maxIterations: number;
+  /**
+   * When the budget is exhausted without `halt: true`.
+   * Default `fail` is a fuse against accidental infinite loops.
+   * Precision / agent flows that may legally stop early should set `succeed`.
+   */
+  onMaxIterations?: 'fail' | 'succeed';
+}
+
 export interface ExpandConfig {
   foreach: string;
   as: string;
@@ -98,6 +112,7 @@ export interface FlowNodeDefinition {
   join?: JoinConfig;
   spawn?: SpawnConfig;
   coordinator?: CoordinatorConfig;
+  loop?: LoopConfig;
   tags?: string[];
   meta?: Record<string, unknown>;
 }

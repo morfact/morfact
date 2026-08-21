@@ -50,6 +50,15 @@ export type HookExecutionResult<TOutput = unknown> =
       readonly status: 'waiting';
       readonly reason: 'external' | 'interaction' | 'child_run';
       readonly resumeToken: string;
+    }
+  | {
+      readonly status: 'continue';
+      /** Opaque business checkpoint for the next iteration. */
+      readonly checkpoint: unknown;
+      /** Next iteration index to persist (0-based). */
+      readonly iteration: number;
+      /** Optional visible progress for this round. */
+      readonly output?: unknown;
     };
 
 export interface HookDefinition<
@@ -274,9 +283,19 @@ export interface SuspendTaskCommand {
   readonly now: Date;
 }
 
+export interface CommitTaskContinueCommand {
+  readonly commandId: string;
+  readonly taskId: string;
+  readonly leaseToken: string;
+  readonly checkpoint: unknown;
+  readonly iteration: number;
+  readonly output?: unknown;
+  readonly now: Date;
+}
+
 export interface TaskCommitResult {
   readonly taskId: string;
-  readonly taskStatus: 'succeeded' | 'failed' | 'waiting';
+  readonly taskStatus: 'succeeded' | 'failed' | 'waiting' | 'ready';
   readonly runStatus: WorkflowRunStatus;
   readonly unlockedTaskIds: readonly string[];
   readonly replayed: boolean;
@@ -467,6 +486,14 @@ export interface WorkflowStateStore {
   commitTaskFailure(
     command: CommitTaskFailureCommand,
   ): Promise<TaskCommitResult>;
+  /**
+   * Optional. Required to run `@morfact/core/loop`.
+   * Commits this round's checkpoint/progress, re-queues the same task,
+   * and must not unlock downstream nodes.
+   */
+  commitTaskContinue?(
+    command: CommitTaskContinueCommand,
+  ): Promise<TaskCommitResult>;
   suspendTask(command: SuspendTaskCommand): Promise<TaskCommitResult>;
   resumeTask(command: ResumeTaskCommand): Promise<TaskRun>;
   cancelTask(command: CancelTaskCommand): Promise<TaskRun>;
@@ -522,7 +549,7 @@ export interface ExecuteTaskCommand extends ExecuteNextTaskCommand {
 export interface ExecuteTaskResult {
   readonly taskId: string;
   readonly runId: string;
-  readonly status: 'succeeded' | 'waiting';
+  readonly status: 'succeeded' | 'waiting' | 'continue';
 }
 
 export interface EngineOptions {
