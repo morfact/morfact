@@ -1,0 +1,51 @@
+{
+  "name": "@morfact/memory",
+  "version": "0.1.0",
+  "description": "In-memory WorkflowStateStore adapter for morfact workflow engine — zero-dependency test harness",
+  "type": "module",
+  "private": false,
+  "license": "MIT",
+  "author": "Mozex Team",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mozex/morfact"
+  },
+  "keywords": [
+    "morfact",
+    "workflow",
+    "testing",
+    "in-memory",
+    "store"
+  ],
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepublishOnly": "pnpm run build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --config vitest.config.ts --passWithNoTests"
+  },
+  "peerDependencies": {
+    "@morfact/core": "^0.1.0"
+  },
+  "devDependencies": {
+    "@morfact/core": "workspace:*",
+    "typescript": "^5.6.3",
+    "vitest": "^3.0.5"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
