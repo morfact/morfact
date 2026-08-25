@@ -36,14 +36,14 @@ A host app only does three things: **choose or implement a Store, register plugi
 ## 2. Concepts
 
 ```text
-createEngine({ store, plugins })
+createEngine({ store, plugins, lifecycle? })
         │
         ▼
    startRun(workflow@version)
         │  create Run + materialize Tasks
         ▼
    executeNextTask / executeTask
-        │  claim → run hook → commit / suspend
+        │  claim → lifecycle → hook → lifecycle → commit / suspend
         ▼
    succeeded | waiting (human / child run / external poll)
    continue  (same task, next iteration; downstream stays locked)
@@ -52,6 +52,7 @@ createEngine({ store, plugins })
 | Term | Meaning |
 |---|---|
 | **Hook** | One executable unit. `name` is globally unique, e.g. `demo.greet@1` |
+| **Lifecycle** | Cross-cutting observer on *every* task (`createEngine({ lifecycle })`). Not a business hook |
 | **Workflow** | An immutable DAG snapshot, `name@version` |
 | **Plugin** | A set of hooks + workflows, passed explicitly to `createEngine` |
 | **Run** | One execution instance |
@@ -371,6 +372,54 @@ Throw retries the **same** iteration through existing `maxAttempts`. The next it
 
 This is not polling: each continue is a real commit of progress, the node stays incomplete, and the engine re-enqueues **the same task**. Do not reuse `completePollingTask`. Production stores must implement `commitTaskContinue` (re-queue, persist `meta.loopState`, do **not** unlock downstream).
 
+Body hook example (pagination). Register this hook on the same engine; `loop.body` is its `name`:
+
+```ts
+import { defineHook } from '@morfact/core';
+
+const paginatePage = defineHook({
+  name: 'book.paginate_page@1',
+  async execute(_ctx, input: {
+    bookId: string;
+    loop?: { iteration: number; checkpoint?: { cursor: string | null } };
+  }) {
+    const cursor = input.loop?.checkpoint?.cursor ?? null;
+    const page = await fetchPage({ bookId: input.bookId, cursor });
+
+    if (!page.nextCursor) {
+      return {
+        status: 'succeeded' as const,
+        output: {
+          halt: true,
+          checkpoint: { cursor: null },
+          output: { items: page.items },
+        },
+      };
+    }
+
+    return {
+      status: 'succeeded' as const,
+      output: {
+        halt: false,
+        checkpoint: { cursor: page.nextCursor },
+        output: { items: page.items },
+      },
+    };
+  },
+});
+```
+
+Without an outbox worker, drain continues in-process:
+
+```ts
+let result;
+do {
+  result = await engine.executeNextTask({ workerId: 'w1' });
+} while (result?.status === 'continue');
+```
+
+`executeTask` / `executeNextTask` returns `status: 'continue'` when the node is not done. A production worker should treat that like any other re-queued ready task (the Store writes outbox on `commitTaskContinue`).
+
 ---
 
 ## 7. Queue integration (outbox)
@@ -402,7 +451,60 @@ Do not put a full Task/Run snapshot in the message body and treat it as authorit
 
 ---
 
-## 8. Engine API
+## 8. Task lifecycle
+
+Engine-level callbacks that run for **every** claimed task. Use them for billing, metrics, audit, quotas — not for node business logic (that stays in `defineHook`).
+
+Register only on the engine (plugins cannot attach lifecycle):
+
+```ts
+import { createEngine, defineLifecycle } from '@morfact/core';
+
+const billing = defineLifecycle({
+  name: 'billing',
+  order: 10, // lower runs first; default 0
+  async beforeExecute(event) {
+    // Hold / reject before the business hook runs.
+    // May return { input } to rewrite hook input, or { shortCircuit: result }
+    // to skip the hook and go straight to commit.
+  },
+  async beforeCommit(event) {
+    // Business result is known: event.result + event.commitKind
+    // ('success' | 'waiting' | 'continue'). Throw to fail the task
+    // (commitTaskFailure + onTaskFailed) instead of committing success.
+  },
+  async onTaskFailed(event) {
+    // Release a hold. Soft phase: errors are swallowed via onLifecycleError.
+  },
+  async afterCommit(event) {
+    // Metrics / audit only. Soft phase — must not be the source of truth
+    // for money or other critical side effects.
+  },
+});
+
+createEngine({ store, plugins, lifecycle: [billing] });
+```
+
+Pipeline (hard phases throw → task failure):
+
+```text
+claim
+  → onTaskClaimed          (soft)
+  → beforeExecute          (hard; may rewrite input / shortCircuit)
+  → hook.execute           (skipped if shortCircuit)
+  → afterExecute           (hard; may rewrite result)
+  → beforeCommit           (hard; sees commitKind)
+  → store commit / suspend
+  → afterCommit            (soft)
+```
+
+On any hard-phase / heartbeat failure before a successful store write: `commitTaskFailure`, then `onTaskFailed` (soft).
+
+Multiple lifecycles run in `order` ascending (registration order ties). Rewrite results pipeline: later handlers see earlier rewrites; `shortCircuit` stops further `beforeExecute` handlers and skips the business hook (still runs `afterExecute` → commit).
+
+---
+
+## 9. Engine API
 
 ```ts
 await engine.validate();
@@ -427,11 +529,11 @@ await engine.listTasks(runId);
 await engine.listRuns({ tenantKey: 'user-1', status: 'running' });
 ```
 
-`createEngine` options: `store` (required), `plugins`, `services`, `childTemplateRegistry`, `now`, `idGenerator`.
+`createEngine` options: `store` (required), `plugins`, `lifecycle`, `services`, `childTemplateRegistry`, `now`, `idGenerator`.
 
 ---
 
-## 9. Implementing a production Store
+## 10. Implementing a production Store
 
 Implement `WorkflowStateStore` with `protocolVersion: 1`. Claim, commit, and downstream unlock must be atomic.
 
@@ -454,15 +556,15 @@ For local/tests, use `new MemoryWorkflowStateStore()`. It already implements `ap
 
 ---
 
-## 10. Public entrypoints
+## 11. Public entrypoints
 
 Only these are supported:
 
 ```ts
-import { createEngine } from '@morfact/core';
+import { createEngine, defineLifecycle } from '@morfact/core';
 import { storeConformanceCases } from '@morfact/core/testing';
 ```
 
 Do not `import '@morfact/core/dist/...'`.
 
-Current version is `0.1.0`. Store protocol and definition `schemaVersion` are both `1`. Incompatible combinations must fail in `createEngine` / `validate()` — no silent fallback.
+Current version is `0.1.1`. Store protocol and definition `schemaVersion` are both `1`. Incompatible combinations must fail in `createEngine` / `validate()` — no silent fallback.
