@@ -567,4 +567,4 @@ import { storeConformanceCases } from '@morfact/core/testing';
 
 Do not `import '@morfact/core/dist/...'`.
 
-Current version is `0.1.1`. Store protocol and definition `schemaVersion` are both `1`. Incompatible combinations must fail in `createEngine` / `validate()` — no silent fallback.
+Current version is `0.1.2`. Store protocol and definition `schemaVersion` are both `1`. Incompatible combinations must fail in `createEngine` / `validate()` — no silent fallback.

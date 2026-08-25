@@ -1,6 +1,6 @@
 {
   "name": "@morfact/memory",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "In-memory WorkflowStateStore adapter for morfact workflow engine — zero-dependency test harness",
   "type": "module",
   "private": false,

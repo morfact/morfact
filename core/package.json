@@ -1,6 +1,6 @@
 {
   "name": "@morfact/core",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Composable, storage-agnostic workflow orchestration runtime — define DAGs, spawn child runs, route by condition, and execute hooks with built-in retry/lease/outbox.",
   "type": "module",
   "private": false,
