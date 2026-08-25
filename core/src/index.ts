@@ -1,4 +1,9 @@
-export { defineHook, definePlugin, defineWorkflow } from './definitions.js';
+export {
+  defineHook,
+  defineLifecycle,
+  definePlugin,
+  defineWorkflow,
+} from './definitions.js';
 export { createEngine } from './engine.js';
 export { createOutboxDispatcher } from './outbox-dispatcher.js';
 export {
@@ -119,7 +124,10 @@ export type {
   AppendTasksCommand,
   CreateInteractionCommand,
   CreateRunCommand,
+  AfterExecuteResult,
+  BeforeExecuteResult,
   Engine,
+  EngineLifecycle,
   EngineOptions,
   ExecuteNextTaskCommand,
   ExecuteTaskCommand,
@@ -140,11 +148,14 @@ export type {
   StoreCapabilities,
   SubmitInteractionCommand,
   SuspendTaskCommand,
+  TaskCommitKind,
   TaskCommitResult,
   TaskDep,
   TaskInteraction,
   TaskInteractionKind,
   TaskInteractionStatus,
+  TaskLifecycleEvent,
+  TaskLifecyclePhase,
   TaskRun,
   TaskRunStatus,
   WorkflowDefinition,

@@ -5,8 +5,10 @@ import type {
   ExecuteTaskCommand,
   ExecuteTaskResult,
   HookDefinition,
+  HookExecutionResult,
   ListRunsFilter,
   StartRunCommand,
+  TaskLifecycleEvent,
   TaskRun,
   WorkflowDefinition,
 } from './contracts.js';
@@ -31,6 +33,14 @@ import {
   mergeEngineServices,
 } from './builtin-services.js';
 import type { InteractionConfig } from './flow-types.js';
+import {
+  commitKindFromResult,
+  dispatchBeforeCommit,
+  dispatchSoftLifecycle,
+  runAfterExecute,
+  runBeforeExecute,
+  sortLifecycles,
+} from './lifecycle.js';
 
 function workflowKey(name: string, version: string): string {
   return `${name}@${version}`;
@@ -85,6 +95,7 @@ export function createEngine(options: EngineOptions): Engine {
   const workflows = new Map<string, WorkflowDefinition>();
   const now = options.now ?? (() => new Date());
   const createId = options.idGenerator ?? defaultIdGenerator;
+  const lifecycles = sortLifecycles(options.lifecycle ?? []);
   let runtimeServices: unknown = options.services;
 
   const builtinHooks: readonly HookDefinition[] = [
@@ -124,6 +135,30 @@ export function createEngine(options: EngineOptions): Engine {
       );
     }
 
+    const lifecycleBase = {
+      workerId: command.workerId,
+      run: {
+        id: claimed.run.id,
+        tenantKey: claimed.run.tenantKey,
+        input: claimed.run.input,
+        context: claimed.run.context,
+        ...(claimed.run.resourceRef === undefined
+          ? {}
+          : { resourceRef: claimed.run.resourceRef }),
+      },
+      task: {
+        id: claimed.task.id,
+        logicalKey: claimed.task.logicalKey,
+        hook: claimed.task.hook,
+        attempt: claimed.task.attempt,
+      },
+    } as const;
+
+    await dispatchSoftLifecycle(lifecycles, 'onTaskClaimed', {
+      ...lifecycleBase,
+      phase: 'claimed',
+    });
+
     const heartbeatIntervalMs =
       command.heartbeatIntervalMs ?? Math.max(1, Math.floor(leaseDurationMs / 3));
     if (heartbeatIntervalMs >= leaseDurationMs) {
@@ -155,14 +190,17 @@ export function createEngine(options: EngineOptions): Engine {
     }, heartbeatIntervalMs);
     heartbeatTimer.unref?.();
 
-    let result;
+    let result: HookExecutionResult | undefined;
+    let hookInput: unknown;
+    /** True once a store outcome write succeeded (success/waiting/continue/failure). */
+    let finalized = false;
     try {
       try {
         const resolved = resolveWorkflowTaskInput(
           claimed.task.input,
           claimed.run,
         );
-        const hookInput =
+        const resolvedInput =
           resolved &&
           typeof resolved === 'object' &&
           !Array.isArray(resolved)
@@ -171,141 +209,219 @@ export function createEngine(options: EngineOptions): Engine {
                 claimed.task,
               )
             : resolved;
-        result = await hook.execute(
-          {
-            run: {
-              id: claimed.run.id,
-              tenantKey: claimed.run.tenantKey,
-              input: claimed.run.input,
-              context: claimed.run.context,
-              ...(claimed.run.resourceRef === undefined
-                ? {}
-                : { resourceRef: claimed.run.resourceRef }),
+
+        const before = await runBeforeExecute(lifecycles, {
+          ...lifecycleBase,
+          input: resolvedInput,
+        });
+        hookInput = before.input;
+
+        if (before.shortCircuit !== undefined) {
+          result = before.shortCircuit;
+        } else {
+          result = await hook.execute(
+            {
+              run: {
+                id: claimed.run.id,
+                tenantKey: claimed.run.tenantKey,
+                input: claimed.run.input,
+                context: claimed.run.context,
+                ...(claimed.run.resourceRef === undefined
+                  ? {}
+                  : { resourceRef: claimed.run.resourceRef }),
+              },
+              task: {
+                id: claimed.task.id,
+                logicalKey: claimed.task.logicalKey,
+                attempt: claimed.task.attempt,
+              },
+              services: runtimeServices,
+              signal: command.signal ?? new AbortController().signal,
+              now,
             },
-            task: {
-              id: claimed.task.id,
-              logicalKey: claimed.task.logicalKey,
-              attempt: claimed.task.attempt,
-            },
-            services: runtimeServices,
-            signal: command.signal ?? new AbortController().signal,
-            now,
-          },
-          hookInput,
+            hookInput,
+          );
+        }
+
+        result = await runAfterExecute(lifecycles, {
+          ...lifecycleBase,
+          input: hookInput,
+          result,
+        });
+      } finally {
+        clearInterval(heartbeatTimer);
+        await heartbeatPromise;
+      }
+
+      if (heartbeatFailure !== undefined) {
+        throw new StoreProtocolError(
+          `Task heartbeat failed before commit: ${
+            heartbeatFailure instanceof Error
+              ? heartbeatFailure.message
+              : String(heartbeatFailure)
+          }`,
+          { cause: heartbeatFailure },
         );
-      } catch (error) {
-        await options.store.commitTaskFailure({
+      }
+
+      if (result === undefined) {
+        throw new StoreProtocolError('Task execution produced no result');
+      }
+
+      const commitKind = commitKindFromResult(result);
+      await dispatchBeforeCommit(lifecycles, {
+        ...lifecycleBase,
+        phase: 'beforeCommit',
+        input: hookInput,
+        result,
+        commitKind,
+      });
+
+      if (result.status === 'waiting') {
+        if (result.reason === 'interaction') {
+          const existing = await options.store.listInteractions(claimed.task.id);
+          if (existing.length === 0) {
+            const resolvedInput = resolveWorkflowTaskInput(
+              claimed.task.input,
+              claimed.run,
+            ) as Record<string, unknown>;
+            const meta = resolvedInput._meta as
+              | Record<string, unknown>
+              | undefined;
+            const interaction = meta?.interaction as
+              | InteractionConfig
+              | undefined;
+            await options.store.createInteraction({
+              interactionId: createId(),
+              tenantKey: claimed.run.tenantKey,
+              runId: claimed.run.id,
+              taskId: claimed.task.id,
+              kind: interaction?.kind ?? 'input',
+              ...(interaction?.schema !== undefined
+                ? {
+                    schema: interaction.schema as Readonly<
+                      Record<string, unknown>
+                    >,
+                  }
+                : {}),
+              ...(interaction?.uiHints !== undefined
+                ? { uiHints: interaction.uiHints }
+                : {}),
+              now: now(),
+            });
+          }
+        }
+        await options.store.suspendTask({
           commandId: createId(),
           taskId: claimed.task.id,
           leaseToken: claimed.task.leaseToken,
-          error: {
-            message: error instanceof Error ? error.message : String(error),
-          },
+          reason: result.reason,
+          resumeToken: result.resumeToken,
           now: now(),
         });
-        await maybeResumeWaiters(claimed.task.id);
-        throw error;
+        finalized = true;
+        await dispatchSoftLifecycle(lifecycles, 'afterCommit', {
+          ...lifecycleBase,
+          phase: 'afterCommit',
+          input: hookInput,
+          result,
+          commitKind,
+        });
+        return {
+          taskId: claimed.task.id,
+          runId: claimed.run.id,
+          status: 'waiting',
+        };
       }
-    } finally {
-      clearInterval(heartbeatTimer);
-      await heartbeatPromise;
-    }
 
-    if (heartbeatFailure !== undefined) {
-      throw new StoreProtocolError(
-        `Task heartbeat failed before commit: ${
-          heartbeatFailure instanceof Error
-            ? heartbeatFailure.message
-            : String(heartbeatFailure)
-        }`,
-        { cause: heartbeatFailure },
-      );
-    }
+      if (result.status === 'continue') {
+        if (typeof options.store.commitTaskContinue !== 'function') {
+          throw new StoreProtocolError(
+            'Store does not implement commitTaskContinue (required by @morfact/core/loop)',
+          );
+        }
+        if (claimed.task.leaseToken === undefined) {
+          throw new StoreProtocolError(
+            'Claimed task is missing a lease token; cannot commit continue',
+          );
+        }
+        await options.store.commitTaskContinue({
+          commandId: createId(),
+          taskId: claimed.task.id,
+          leaseToken: claimed.task.leaseToken,
+          checkpoint: result.checkpoint,
+          iteration: result.iteration,
+          ...(result.output === undefined ? {} : { output: result.output }),
+          now: now(),
+        });
+        finalized = true;
+        await dispatchSoftLifecycle(lifecycles, 'afterCommit', {
+          ...lifecycleBase,
+          phase: 'afterCommit',
+          input: hookInput,
+          result,
+          commitKind,
+        });
+        return {
+          taskId: claimed.task.id,
+          runId: claimed.run.id,
+          status: 'continue',
+        };
+      }
 
-    if (result.status === 'waiting') {
-      if (result.reason === 'interaction') {
-        const existing = await options.store.listInteractions(claimed.task.id);
-        if (existing.length === 0) {
-          const resolvedInput = resolveWorkflowTaskInput(
-            claimed.task.input,
-            claimed.run,
-          ) as Record<string, unknown>;
-          const meta = resolvedInput._meta as Record<string, unknown> | undefined;
-          const interaction = meta?.interaction as InteractionConfig | undefined;
-          await options.store.createInteraction({
-            interactionId: createId(),
-            tenantKey: claimed.run.tenantKey,
-            runId: claimed.run.id,
+      await options.store.commitTaskSuccess({
+        commandId: createId(),
+        taskId: claimed.task.id,
+        leaseToken: claimed.task.leaseToken,
+        output: result.output,
+        ...(result.contextPatch === undefined
+          ? {}
+          : { contextPatch: result.contextPatch }),
+        now: now(),
+      });
+      finalized = true;
+      await maybeResumeWaiters(claimed.task.id);
+      await dispatchSoftLifecycle(lifecycles, 'afterCommit', {
+        ...lifecycleBase,
+        phase: 'afterCommit',
+        input: hookInput,
+        result,
+        commitKind,
+      });
+      return {
+        taskId: claimed.task.id,
+        runId: claimed.run.id,
+        status: 'succeeded',
+      };
+    } catch (error) {
+      if (!finalized) {
+        try {
+          await options.store.commitTaskFailure({
+            commandId: createId(),
             taskId: claimed.task.id,
-            kind: interaction?.kind ?? 'input',
-            ...(interaction?.schema !== undefined
-              ? { schema: interaction.schema as Readonly<Record<string, unknown>> }
-              : {}),
-            ...(interaction?.uiHints !== undefined
-              ? { uiHints: interaction.uiHints }
-              : {}),
+            leaseToken: claimed.task.leaseToken,
+            error: {
+              message: error instanceof Error ? error.message : String(error),
+            },
             now: now(),
           });
+          finalized = true;
+          await maybeResumeWaiters(claimed.task.id);
+        } catch {
+          // Prefer surfacing the original execution/lifecycle error.
         }
+        const failedEvent: TaskLifecycleEvent = {
+          ...lifecycleBase,
+          phase: 'failed',
+          ...(hookInput === undefined ? {} : { input: hookInput }),
+          ...(result === undefined ? {} : { result }),
+          error,
+          commitKind: 'failure',
+        };
+        await dispatchSoftLifecycle(lifecycles, 'onTaskFailed', failedEvent);
       }
-      await options.store.suspendTask({
-        commandId: createId(),
-        taskId: claimed.task.id,
-        leaseToken: claimed.task.leaseToken,
-        reason: result.reason,
-        resumeToken: result.resumeToken,
-        now: now(),
-      });
-      return {
-        taskId: claimed.task.id,
-        runId: claimed.run.id,
-        status: 'waiting',
-      };
+      throw error;
     }
-
-    if (result.status === 'continue') {
-      if (typeof options.store.commitTaskContinue !== 'function') {
-        throw new StoreProtocolError(
-          'Store does not implement commitTaskContinue (required by @morfact/core/loop)',
-        );
-      }
-      if (claimed.task.leaseToken === undefined) {
-        throw new StoreProtocolError(
-          'Claimed task is missing a lease token; cannot commit continue',
-        );
-      }
-      await options.store.commitTaskContinue({
-        commandId: createId(),
-        taskId: claimed.task.id,
-        leaseToken: claimed.task.leaseToken,
-        checkpoint: result.checkpoint,
-        iteration: result.iteration,
-        ...(result.output === undefined ? {} : { output: result.output }),
-        now: now(),
-      });
-      return {
-        taskId: claimed.task.id,
-        runId: claimed.run.id,
-        status: 'continue',
-      };
-    }
-
-    await options.store.commitTaskSuccess({
-      commandId: createId(),
-      taskId: claimed.task.id,
-      leaseToken: claimed.task.leaseToken,
-      output: result.output,
-      ...(result.contextPatch === undefined
-        ? {}
-        : { contextPatch: result.contextPatch }),
-      now: now(),
-    });
-    await maybeResumeWaiters(claimed.task.id);
-    return {
-      taskId: claimed.task.id,
-      runId: claimed.run.id,
-      status: 'succeeded',
-    };
   }
 
   async function maybeResumeWaiters(taskId: string): Promise<void> {

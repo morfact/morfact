@@ -1,4 +1,5 @@
 import type {
+  EngineLifecycle,
   HookDefinition,
   WorkflowDefinition,
   WorkflowPlugin,
@@ -22,4 +23,11 @@ export function defineWorkflow(
 
 export function definePlugin(plugin: WorkflowPlugin): WorkflowPlugin {
   return Object.freeze(plugin);
+}
+
+/** Freeze an engine-level lifecycle (not a business hook). */
+export function defineLifecycle(
+  definition: EngineLifecycle,
+): EngineLifecycle {
+  return Object.freeze(definition);
 }

@@ -552,9 +552,85 @@ export interface ExecuteTaskResult {
   readonly status: 'succeeded' | 'waiting' | 'continue';
 }
 
+/**
+ * Engine-level task lifecycle (cross-cutting). Not a business {@link HookDefinition}.
+ *
+ * Rewrite is only allowed from `beforeExecute` / `afterExecute`.
+ * Soft phases (`onTaskClaimed` / `afterCommit` / `onTaskFailed`) must not
+ * mutate execution outcome; errors there are swallowed via `onLifecycleError`.
+ */
+export type TaskLifecyclePhase =
+  | 'claimed'
+  | 'beforeExecute'
+  | 'afterExecute'
+  | 'beforeCommit'
+  | 'afterCommit'
+  | 'failed';
+
+export type TaskCommitKind = 'success' | 'waiting' | 'continue' | 'failure';
+
+export interface TaskLifecycleEvent {
+  readonly phase: TaskLifecyclePhase;
+  readonly workerId: string;
+  readonly run: {
+    readonly id: string;
+    readonly tenantKey: string;
+    readonly resourceRef?: string;
+    readonly input: Readonly<Record<string, unknown>>;
+    readonly context: Readonly<Record<string, unknown>>;
+  };
+  readonly task: {
+    readonly id: string;
+    readonly logicalKey: string;
+    readonly hook: string;
+    readonly attempt: number;
+  };
+  readonly input?: unknown;
+  readonly result?: HookExecutionResult;
+  readonly error?: unknown;
+  readonly commitKind?: TaskCommitKind;
+}
+
+export type BeforeExecuteResult =
+  | { readonly input: unknown }
+  | { readonly shortCircuit: HookExecutionResult };
+
+export type AfterExecuteResult = {
+  readonly result: HookExecutionResult;
+};
+
+export interface EngineLifecycle {
+  readonly name: string;
+  /** Lower runs first. Default 0. Same order keeps registration order. */
+  readonly order?: number;
+  onTaskClaimed?(event: TaskLifecycleEvent): void | Promise<void>;
+  beforeExecute?(
+    event: TaskLifecycleEvent,
+  ): void | Promise<void | BeforeExecuteResult>;
+  afterExecute?(
+    event: TaskLifecycleEvent,
+  ): void | Promise<void | AfterExecuteResult>;
+  beforeCommit?(event: TaskLifecycleEvent): void | Promise<void>;
+  afterCommit?(event: TaskLifecycleEvent): void | Promise<void>;
+  onTaskFailed?(event: TaskLifecycleEvent): void | Promise<void>;
+  /**
+   * Invoked when a soft-phase callback throws (`onTaskClaimed` / `afterCommit` /
+   * `onTaskFailed`). Errors from this handler are ignored.
+   */
+  onLifecycleError?(
+    error: unknown,
+    event: TaskLifecycleEvent,
+  ): void | Promise<void>;
+}
+
 export interface EngineOptions {
   readonly store: WorkflowStateStore;
   readonly plugins?: readonly WorkflowPlugin[];
+  /**
+   * Cross-cutting task lifecycle observers / rewriters.
+   * Register only here — plugins cannot attach lifecycle.
+   */
+  readonly lifecycle?: readonly EngineLifecycle[];
   readonly services?: unknown;
   readonly now?: () => Date;
   readonly idGenerator?: () => string;
