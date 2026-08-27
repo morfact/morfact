@@ -258,12 +258,95 @@ const flowsPlugin = definePlugin({
 });
 ```
 
-`type: spawn | gate | coordinator | join | completed` binds to the matching built-in hook automatically. You do not need `hooks.executor.use` for those types (the type wins if both are set).
+`type: spawn | gate | coordinator | group | join | completed | loop` binds to the matching built-in behavior. Built-in types do not need `hooks.executor.use` unless you override the executor (the `type` wins when both are set).
+
+### 5.1 Group nodes (composite tasks)
+
+`type: group` defines a **named composite** — a small subgraph of simple tasks that can live directly in the main DAG or be fanned out by a coordinator.
+
+```yaml
+spec:
+  nodes:
+    - id: film_spec
+      type: group
+      group:
+        tasks:
+          - id: gen_a
+            type: business
+            hooks:
+              executor:
+                use: film.theme_tone@1
+          - id: gen_b
+            type: business
+            hooks:
+              executor:
+                use: film.world_bible@1
+          - id: finalize
+            type: business
+            hooks:
+              executor:
+                use: film.spec_finalize@1
+        edges:
+          - { from: gen_a, to: finalize }
+          - { from: gen_b, to: finalize }
+        exits: [finalize]
+
+    - id: downstream
+      type: business
+      hooks:
+        executor:
+          use: film.next_step@1
+
+  edges:
+    - { from: film_spec, to: downstream }
+```
+
+**Standalone group** (wired by edges): compiled **inline** at `compileFlow()` time. No coordinator, no `appendTasks`. Logical keys: `{groupId}.{taskId}` (e.g. `film_spec.finalize`).
+
+**Fan-out** (dynamic N): keep a coordinator that references the group:
+
+```yaml
+    - id: act_plan
+      type: group
+      group:
+        tasks:
+          - id: plan
+            type: plan
+            hooks:
+              executor:
+                use: film.act_plan@1
+            inputTemplate:
+              act_index: "{{groupIndex}}"
+
+    - id: act_plan_fanout
+      type: coordinator
+      coordinator:
+        groupRef: act_plan
+        groupCount: "{{params.recommended_act_count}}"
+        groupStrategy: sequential   # parallel | sequential
+      hooks:
+        executor:
+          use: "@morfact/core/coordinator"
+```
+
+Runtime logical keys for `groupRef` fan-out: `{groupId}.{taskId}[{i}]`.
+
+**Group constraints**
+
+- Allowed inner types: `business`, `bridge`, `plan`, `input`, `merge`, `completed`
+- Forbidden inside groups: `coordinator`, `spawn`, `loop`, `gate`, `router`, `join`, nested `group`
+- Inner scheduling: `group.edges` (simple DAG), or `strategy: parallel | sequential` when no edges
+- Boundary: upstream → group connects to **entry** tasks; group → downstream waits for **exit** tasks (`exits` optional; defaults to terminal inner nodes)
+
+**Legacy `taskGroupTemplates`**
+
+Still supported during migration. Prefer `type: group` + `coordinator.groupRef`. Legacy templates compile to the same internal `GroupSpec` and keep runtime keys `{taskId}[{i}]`.
 
 Template expressions:
 
 - `{{params.xxx}}` / `${run.input.xxx}` — run input at `startRun`
 - `{{tasks.nodeId.output.xxx}}` — upstream output (runtime only; compile-time `when` cannot see executed tasks)
+- `{{groupIndex}}` / `{{i}}` — coordinator fan-out index (runtime)
 
 ---
 
@@ -272,7 +355,7 @@ Template expressions:
 | Hook | YAML `type` | Behavior |
 |---|---|---|
 | `@morfact/core/spawn` | `spawn` | Creates a child run; parent task is `waiting` / `child_run`; the engine resumes the parent when the child finishes |
-| `@morfact/core/coordinator` | `coordinator` | Appends subtasks from `taskGroupTemplates`. The Store **must** implement `appendTasks` |
+| `@morfact/core/coordinator` | `coordinator` | Fans out a **group** (`groupRef`) or legacy `taskGroupTemplates` at runtime. Store **must** implement `appendTasks` |
 | `@morfact/core/join` | `join` | Pass-through once inbound dependencies are cleared |
 | `@morfact/core/gate` | `gate` | Waits for humans while `interaction.schema.required` is missing, and calls `createInteraction` |
 | `@morfact/core/completed` | `completed` | Terminal marker |
@@ -567,4 +650,4 @@ import { storeConformanceCases } from '@morfact/core/testing';
 
 Do not `import '@morfact/core/dist/...'`.
 
-Current version is `0.1.2`. Store protocol and definition `schemaVersion` are both `1`. Incompatible combinations must fail in `createEngine` / `validate()` — no silent fallback.
+Current version is `0.1.3`. Store protocol and definition `schemaVersion` are both `1`. Incompatible combinations must fail in `createEngine` / `validate()` — no silent fallback.

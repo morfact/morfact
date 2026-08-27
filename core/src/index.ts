@@ -34,6 +34,17 @@ export {
 } from './flow-compiler.js';
 
 export {
+  materializeGroupInstance,
+  validateGroupSpec,
+  groupSpecFromNode,
+  groupSpecFromTaskGroupTemplate,
+  resolveGroupEntryTaskIds,
+  resolveGroupExitTaskIds,
+} from './group.js';
+
+export type { GroupSpec, MaterializedGroupTask } from './group.js';
+
+export {
   renderTemplate,
   evaluateWhen,
   parseForeachExpression,
@@ -63,6 +74,10 @@ export type { FlowRegistryOptions } from './template-registry.js';
 
 export type {
   FlowNodeType,
+  GroupInnerNodeType,
+  GroupInnerTask,
+  GroupConfig,
+  EmbeddedGroupSpec,
   RetryPolicy,
   InteractionConfig,
   RouterConfig,

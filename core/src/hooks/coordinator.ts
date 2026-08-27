@@ -26,6 +26,11 @@ export interface CoordinatorTaskDescriptor {
   meta: Record<string, unknown>;
   orderIndex: number;
   groupIndex: number;
+  /** Intra-group deps (logical keys within the same fan-out). */
+  dependsOnLogical?: string[];
+  innerTaskId?: string;
+  isGroupEntry?: boolean;
+  isGroupExit?: boolean;
 }
 
 export interface CoordinatorSubtaskCreateParams {
@@ -95,7 +100,12 @@ export const coordinatorHook: HookDefinition<
       throw new Error('[Coordinator] Missing coordinator config in task meta');
     }
 
-    const { taskGroupTemplate, groupCount: gcExpr, groupStrategy } = coordConfig;
+    const { groupCount: gcExpr, groupStrategy } = coordConfig;
+    const groupLabel =
+      coordConfig.groupRef ??
+      coordConfig.taskGroupTemplate ??
+      coordConfig.groupSpec?.id ??
+      'group';
 
     // Check when condition
     if (coordConfig.when) {
@@ -130,7 +140,7 @@ export const coordinatorHook: HookDefinition<
           reason: 'no_task_groups',
           groupCount: 0,
           totalTaskCount: 0,
-          taskGroupTemplate,
+          taskGroupTemplate: groupLabel,
           status: 'subtasks_completed',
           coordinatorWaiting: false,
         },
@@ -157,7 +167,7 @@ export const coordinatorHook: HookDefinition<
         output: {
           groupCount,
           totalTaskCount: check.totalCount,
-          taskGroupTemplate,
+          taskGroupTemplate: groupLabel,
           groupStrategy,
           status: 'subtasks_completed',
           coordinatorWaiting: false,
@@ -179,7 +189,7 @@ export const coordinatorHook: HookDefinition<
         output: {
           groupCount,
           totalTaskCount: 0,
-          taskGroupTemplate,
+          taskGroupTemplate: groupLabel,
           groupStrategy,
           status: 'subtasks_completed',
           coordinatorWaiting: false,

@@ -8,6 +8,8 @@ import type {
   FlowEdge,
   FlowNodeDefinition,
   FlowSubtaskTemplate,
+  CoordinatorConfig,
+  EmbeddedGroupSpec,
 } from './flow-types.js';
 import type {
   MaterializedTask,
@@ -22,8 +24,123 @@ import {
   parseForeachExpression,
   type RenderContext,
 } from './template-engine.js';
+import {
+  groupSpecFromNode,
+  groupSpecFromTaskGroupTemplate,
+  materializeGroupInstance,
+  resolveGroupEntryTaskIds,
+  resolveGroupExitTaskIds,
+  validateGroupSpec,
+  type GroupSpec,
+  type MaterializedGroupTask,
+} from './group.js';
 
 // ─── Public API ────────────────────────────────────────────────────────────
+
+function buildGroupRegistry(flow: FlowDefinition): Map<string, GroupSpec> {
+  const registry = new Map<string, GroupSpec>();
+
+  for (const node of flow.spec.nodes) {
+    if (node.type === 'group' && node.group) {
+      registry.set(node.id, groupSpecFromNode(node.id, node.group));
+    }
+  }
+
+  const templates = flow.spec.taskGroupTemplates ?? {};
+  for (const [name, tmpl] of Object.entries(templates)) {
+    if (!registry.has(name)) {
+      registry.set(name, groupSpecFromTaskGroupTemplate(name, tmpl));
+    }
+  }
+
+  return registry;
+}
+
+function resolveCoordinatorConfig(
+  node: FlowNodeDefinition,
+): CoordinatorConfig | undefined {
+  if (node.coordinator) return node.coordinator;
+  if (node.type !== 'coordinator') return undefined;
+  const meta = node.meta;
+  if (!meta) return undefined;
+  const groupRef =
+    typeof meta.groupRef === 'string' ? meta.groupRef : undefined;
+  const taskGroupTemplate =
+    typeof meta.taskGroupTemplate === 'string'
+      ? meta.taskGroupTemplate
+      : undefined;
+  if (!groupRef && !taskGroupTemplate) return undefined;
+  return {
+    ...(groupRef !== undefined ? { groupRef } : {}),
+    ...(taskGroupTemplate !== undefined ? { taskGroupTemplate } : {}),
+    groupCount:
+      (meta.groupCount as string | number | undefined) ?? 1,
+    ...(meta.groupStrategy !== undefined
+      ? {
+          groupStrategy: meta.groupStrategy as 'sequential' | 'parallel',
+        }
+      : {}),
+    ...(meta.when !== undefined ? { when: String(meta.when) } : {}),
+  };
+}
+
+function embedCoordinatorGroupSpec(
+  flow: FlowDefinition,
+  config: CoordinatorConfig,
+  registry: Map<string, GroupSpec>,
+): CoordinatorConfig {
+  if (config.groupRef) {
+    const spec = registry.get(config.groupRef);
+    if (!spec) {
+      throw new WorkflowValidationError(
+        `Coordinator references unknown groupRef '${config.groupRef}'`,
+      );
+    }
+    return {
+      ...config,
+      groupSpec: spec as EmbeddedGroupSpec,
+    };
+  }
+
+  if (config.taskGroupTemplate) {
+    const spec = registry.get(config.taskGroupTemplate);
+    const legacy = flow.spec.taskGroupTemplates?.[config.taskGroupTemplate];
+    if (!spec && !legacy) {
+      throw new WorkflowValidationError(
+        `Coordinator references unknown taskGroupTemplate '${config.taskGroupTemplate}'`,
+      );
+    }
+    const resolved =
+      spec ??
+      groupSpecFromTaskGroupTemplate(config.taskGroupTemplate, legacy!);
+    return {
+      ...config,
+      groupSpec: resolved as EmbeddedGroupSpec,
+      ...(legacy !== undefined ? { taskGroupTemplateSpec: legacy } : {}),
+    };
+  }
+
+  return config;
+}
+
+function groupIsWiredInGraph(groupId: string, edges: FlowEdge[]): boolean {
+  return edges.some((e) => e.from === groupId || e.to === groupId);
+}
+
+function materializedGroupToExpanded(
+  tasks: MaterializedGroupTask[],
+): ExpandedTask[] {
+  return tasks.map((t) => ({
+    logicalKey: t.logicalKey,
+    baseNodeId: t.meta.groupId as string,
+    hook: t.hook,
+    queue: t.queue,
+    input: t.input,
+    maxAttempts: t.maxAttempts,
+    dependsOnLogical: [...t.dependsOnLogical],
+    meta: t.meta,
+  }));
+}
 
 export function validateFlowDefinition(
   flow: FlowDefinition,
@@ -44,6 +161,16 @@ export function validateFlowDefinition(
   const nodes = flow.spec.nodes;
   const edges = flow.spec.edges ?? [];
   const nodeById = new Map(nodes.map((n) => [n.id, n]));
+  const groupRegistry = buildGroupRegistry(flow);
+
+  for (const spec of groupRegistry.values()) {
+    validateGroupSpec(
+      spec,
+      availableHooks,
+      `Group '${spec.id}'`,
+    );
+  }
+
   const outEdges = (id: string) => edges.filter((e) => e.from === id);
   const inEdges = (id: string) => edges.filter((e) => e.to === id);
 
@@ -62,6 +189,21 @@ export function validateFlowDefinition(
   for (const node of nodes) {
     if (node.type === 'completed') continue;
     if (node.type === 'join') continue; // join is a built-in passthrough
+    if (node.type === 'group') continue;
+    if (node.type === 'coordinator') {
+      if (!availableHooks.has('@morfact/core/coordinator')) {
+        throw new WorkflowValidationError(
+          `Flow node ${node.id} references missing hook: @morfact/core/coordinator`,
+        );
+      }
+      const coord = resolveCoordinatorConfig(node);
+      if (!coord?.groupRef && !coord?.taskGroupTemplate) {
+        throw new WorkflowValidationError(
+          `Coordinator '${node.id}' requires coordinator.groupRef or coordinator.taskGroupTemplate`,
+        );
+      }
+      continue;
+    }
     if (node.type === 'loop') {
       if (!availableHooks.has('@morfact/core/loop')) {
         throw new WorkflowValidationError(
@@ -210,6 +352,8 @@ export function compileFlow(
   const defaultMaxAttempts = policies.retry?.maxAttempts ?? policies.defaultMaxAttempts ?? 5;
   const edges = flow.spec.edges ?? [];
   const variables = flow.spec.variables ?? {};
+  const groupRegistry = buildGroupRegistry(flow);
+  const nodeById = new Map(flow.spec.nodes.map((n) => [n.id, n]));
 
   const renderCtx: RenderContext = {
     params: params ?? {},
@@ -217,6 +361,9 @@ export function compileFlow(
     vars: variables,
     tasks: {},
   };
+
+  const groupEntryKeys = new Map<string, string[]>();
+  const groupExitKeys = new Map<string, string[]>();
 
   // ── Step 1: Expand nodes ──
   const nodeExpandedKeys = new Map<string, string[]>();
@@ -228,7 +375,36 @@ export function compileFlow(
       if (!evaluateWhen(node.when, renderCtx)) continue;
     }
 
-    const instances = expandNode(flow, node, renderCtx);
+    if (node.type === 'group') {
+      if (!groupIsWiredInGraph(node.id, edges)) {
+        nodeExpandedKeys.set(node.id, []);
+        continue;
+      }
+      const spec = groupRegistry.get(node.id);
+      if (!spec) continue;
+      const instances = materializedGroupToExpanded(
+        materializeGroupInstance({
+          spec,
+          renderCtx,
+          ...(defaultQueue !== undefined ? { defaultQueue } : {}),
+          defaultMaxAttempts,
+        }),
+      );
+      const keys = instances.map((inst) => inst.logicalKey);
+      nodeExpandedKeys.set(node.id, keys);
+      groupEntryKeys.set(
+        node.id,
+        resolveGroupEntryTaskIds(spec).map((tid) => `${node.id}.${tid}`),
+      );
+      groupExitKeys.set(
+        node.id,
+        resolveGroupExitTaskIds(spec).map((tid) => `${node.id}.${tid}`),
+      );
+      expanded.push(...instances);
+      continue;
+    }
+
+    const instances = expandNode(flow, node, renderCtx, groupRegistry);
     const keys = instances.map((inst) => inst.logicalKey);
     nodeExpandedKeys.set(node.id, keys);
     expanded.push(...instances);
@@ -239,8 +415,17 @@ export function compileFlow(
   for (const t of expanded) expandedMap.set(t.logicalKey, t);
 
   for (const edge of edges) {
-    const fromKeys = nodeExpandedKeys.get(edge.from) ?? [];
-    const toKeys = nodeExpandedKeys.get(edge.to) ?? [];
+    const fromNode = nodeById.get(edge.from);
+    const toNode = nodeById.get(edge.to);
+
+    const fromKeys =
+      fromNode?.type === 'group'
+        ? (groupExitKeys.get(edge.from) ?? [])
+        : (nodeExpandedKeys.get(edge.from) ?? []);
+    const toKeys =
+      toNode?.type === 'group'
+        ? (groupEntryKeys.get(edge.to) ?? [])
+        : (nodeExpandedKeys.get(edge.to) ?? []);
 
     if (fromKeys.length === 0 || toKeys.length === 0) continue;
 
@@ -361,6 +546,7 @@ function expandNode(
   flow: FlowDefinition,
   node: FlowNodeDefinition,
   renderCtx: RenderContext,
+  groupRegistry: Map<string, GroupSpec>,
 ): ExpandedTask[] {
   const policies = flow.spec.policies ?? {};
   const defaultQueue = policies.defaultQueue;
@@ -370,16 +556,9 @@ function expandNode(
   const hook = resolveHook(node);
   const queue = node.queue ?? defaultQueue ?? 'default';
 
-  const coordinatorMeta = node.coordinator
-    ? {
-        ...node.coordinator,
-        ...(flow.spec.taskGroupTemplates?.[node.coordinator.taskGroupTemplate]
-          ? {
-              taskGroupTemplateSpec:
-                flow.spec.taskGroupTemplates[node.coordinator.taskGroupTemplate],
-            }
-          : {}),
-      }
+  const rawCoord = resolveCoordinatorConfig(node);
+  const coordinatorMeta = rawCoord
+    ? embedCoordinatorGroupSpec(flow, rawCoord, groupRegistry)
     : undefined;
 
   const baseMeta: Record<string, unknown> = {
@@ -548,55 +727,43 @@ export function loadAndCompileFlowFromFile(
 
 export function compileCoordinatorSubtasks(
   flow: FlowDefinition,
-  coordinator: { taskGroupTemplate: string; groupCount: number; groupStrategy?: 'sequential' | 'parallel' },
+  coordinator: {
+    groupRef?: string;
+    taskGroupTemplate?: string;
+    groupCount: number;
+    groupStrategy?: 'sequential' | 'parallel';
+  },
   availableHooks: ReadonlySet<string>,
   createId: () => string,
   renderCtx: RenderContext,
 ): { tasks: MaterializedTask[]; groupCount: number } {
-  const tmpl = flow.spec.taskGroupTemplates?.[coordinator.taskGroupTemplate];
-  if (!tmpl || !Array.isArray(tmpl.tasks) || tmpl.tasks.length === 0) {
+  const registry = buildGroupRegistry(flow);
+  const ref = coordinator.groupRef ?? coordinator.taskGroupTemplate;
+  if (!ref) {
     return { tasks: [], groupCount: 0 };
   }
+  const spec = registry.get(ref);
+  if (!spec) {
+    return { tasks: [], groupCount: 0 };
+  }
+  validateGroupSpec(spec, availableHooks, `Group '${spec.id}'`);
 
-  const subtasks = tmpl.tasks as FlowSubtaskTemplate[];
   const tasks: MaterializedTask[] = [];
   for (let gi = 0; gi < coordinator.groupCount; gi++) {
-    const groupCtx = { ...renderCtx, groupIndex: gi, i: gi };
-    for (const st of subtasks) {
-      const logicalKey = `${st.id}[${gi}]`;
-      const hook = typeof st.hooks?.executor === 'string'
-        ? st.hooks.executor
-        : st.hooks?.executor?.use;
-      if (!hook) {
-        throw new WorkflowValidationError(
-          `Coordinator subtask ${st.id} has no executor`,
-        );
-      }
-      if (!availableHooks.has(hook)) {
-        throw new WorkflowValidationError(
-          `Coordinator subtask ${st.id} references missing hook: ${hook}`,
-        );
-      }
-
-      const renderedInput: Record<string, WorkflowInputValue> = {};
-      if (renderCtx.params) {
-        Object.assign(renderedInput, renderCtx.params);
-      }
-      if (st.inputTemplate) {
-        const rendered = renderTemplate(st.inputTemplate, groupCtx);
-        if (rendered && typeof rendered === 'object') {
-          Object.assign(renderedInput, rendered);
-        }
-      }
-
-      const id = createId();
+    const instances = materializeGroupInstance({
+      spec,
+      renderCtx,
+      defaultMaxAttempts: 5,
+      groupIndex: gi,
+    });
+    for (const inst of instances) {
       tasks.push({
-        id,
-        logicalKey,
-        hook,
-        input: renderedInput,
+        id: createId(),
+        logicalKey: inst.logicalKey,
+        hook: inst.hook,
+        input: inst.input,
         dependsOn: [],
-        maxAttempts: 5,
+        maxAttempts: inst.maxAttempts,
       });
     }
   }

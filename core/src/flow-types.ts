@@ -7,6 +7,7 @@ export type FlowNodeType =
   | 'bridge'
   | 'coordinator'
   | 'gate'
+  | 'group'
   | 'input'
   | 'merge'
   | 'plan'
@@ -15,6 +16,40 @@ export type FlowNodeType =
   | 'join'
   | 'loop'
   | 'completed';
+
+/** Allowed inner task types inside a group node. */
+export type GroupInnerNodeType =
+  | 'business'
+  | 'bridge'
+  | 'plan'
+  | 'input'
+  | 'merge'
+  | 'completed';
+
+export interface GroupInnerTask {
+  id: string;
+  type: GroupInnerNodeType;
+  name?: string;
+  queue?: string;
+  maxAttempts?: number;
+  inputTemplate?: Record<string, unknown>;
+  hooks?: FlowNodeDefinition['hooks'];
+  meta?: Record<string, unknown>;
+}
+
+export interface GroupConfig {
+  queue?: string;
+  strategy?: 'parallel' | 'sequential';
+  tasks: GroupInnerTask[];
+  edges?: FlowEdge[];
+  entries?: string[];
+  exits?: string[];
+}
+
+/** Group definition embedded on coordinator at compile time. */
+export interface EmbeddedGroupSpec extends GroupConfig {
+  id: string;
+}
 
 export interface RetryPolicy {
   maxAttempts?: number;
@@ -60,14 +95,23 @@ export interface SpawnConfig {
 }
 
 export interface CoordinatorConfig {
-  taskGroupTemplate: string;
+  /** Reference a type=group node id in the same flow. */
+  groupRef?: string;
+  /**
+   * @deprecated Prefer groupRef + type=group nodes. Coexists during migration.
+   */
+  taskGroupTemplate?: string;
   groupCount: string | number;
   groupStrategy?: 'sequential' | 'parallel';
   when?: string;
   collectSubtaskOutputKeys?: string[];
   /**
-   * Copied from FlowSpec.taskGroupTemplates at compile time so the runtime
-   * does not need the original YAML / FlowRegistry.
+   * Copied from the referenced group or taskGroupTemplates at compile time so
+   * the runtime does not need the original YAML / FlowRegistry.
+   */
+  groupSpec?: EmbeddedGroupSpec;
+  /**
+   * @deprecated Use groupSpec. Kept for backward compatibility.
    */
   taskGroupTemplateSpec?: { tasks: FlowSubtaskTemplate[] };
 }
@@ -112,6 +156,7 @@ export interface FlowNodeDefinition {
   join?: JoinConfig;
   spawn?: SpawnConfig;
   coordinator?: CoordinatorConfig;
+  group?: GroupConfig;
   loop?: LoopConfig;
   tags?: string[];
   meta?: Record<string, unknown>;

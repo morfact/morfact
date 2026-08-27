@@ -11,7 +11,14 @@ import type {
 } from './hooks/coordinator.js';
 import type { SpawnServices } from './hooks/spawn.js';
 import { renderTemplate, type RenderContext } from './template-engine.js';
-import type { CoordinatorConfig, FlowSubtaskTemplate } from './flow-types.js';
+import type { CoordinatorConfig } from './flow-types.js';
+import {
+  groupSpecFromTaskGroupTemplate,
+  materializeGroupInstance,
+  resolveGroupEntryTaskIds,
+  resolveGroupExitTaskIds,
+  type GroupSpec,
+} from './group.js';
 
 export type BuiltinRuntimeServices = SpawnServices & CoordinatorServices;
 
@@ -42,54 +49,52 @@ function evaluateGroupCountValue(
   return typeof rendered === 'number' ? rendered : Number(rendered);
 }
 
-function descriptorsFromTemplate(
-  spec: { tasks: FlowSubtaskTemplate[] },
+function resolveEmbeddedGroupSpec(config: CoordinatorConfig): GroupSpec {
+  if (config.groupSpec?.tasks?.length) {
+    return config.groupSpec as GroupSpec;
+  }
+  if (config.taskGroupTemplateSpec?.tasks?.length) {
+    return groupSpecFromTaskGroupTemplate(
+      config.taskGroupTemplate ?? config.groupRef ?? 'legacy',
+      config.taskGroupTemplateSpec,
+    );
+  }
+  throw new WorkflowValidationError(
+    `Coordinator group was not embedded at compile time (groupRef=${config.groupRef ?? 'none'}). ` +
+      `Use compileFlow() so groupSpec is copied onto the coordinator node.`,
+  );
+}
+
+function descriptorsFromGroupSpec(
+  spec: GroupSpec,
   groupCount: number,
   renderContext: Record<string, unknown>,
 ): CoordinatorTaskDescriptor[] {
-  const tasks = spec.tasks;
+  const entryIds = new Set(resolveGroupEntryTaskIds(spec));
+  const exitIds = new Set(resolveGroupExitTaskIds(spec));
   const descriptors: CoordinatorTaskDescriptor[] = [];
+
   for (let gi = 0; gi < groupCount; gi++) {
-    const groupCtx: RenderContext = {
-      ...asRenderContext(renderContext),
+    const instances = materializeGroupInstance({
+      spec,
+      renderCtx: asRenderContext(renderContext),
+      defaultMaxAttempts: 5,
       groupIndex: gi,
-      i: gi,
-    };
-    for (let ti = 0; ti < tasks.length; ti++) {
-      const st = tasks[ti];
-      if (!st) continue;
-      const hook =
-        typeof st.hooks?.executor === 'string'
-          ? st.hooks.executor
-          : st.hooks?.executor?.use;
-      if (!hook) {
-        throw new WorkflowValidationError(
-          `Coordinator subtask ${st.id} has no executor`,
-        );
-      }
-      const renderedInput: Record<string, unknown> = {
-        ...((renderContext.params as Record<string, unknown> | undefined) ?? {}),
-      };
-      if (st.inputTemplate) {
-        const rendered = renderTemplate(st.inputTemplate, groupCtx);
-        if (rendered && typeof rendered === 'object') {
-          Object.assign(renderedInput, rendered);
-        }
-      }
+    });
+    for (const inst of instances) {
       descriptors.push({
-        logicalId: `${st.id}[${gi}]`,
-        type: hook,
-        name: st.name ?? `${st.id}[${gi}]`,
-        ...(st.queue !== undefined ? { queue: st.queue } : {}),
-        input: renderedInput,
-        meta: {
-          ...(st.meta ?? {}),
-          groupIndex: gi,
-          orderIndex: ti,
-          coordinatorSubtask: true,
-        },
-        orderIndex: ti,
+        logicalId: inst.logicalKey,
+        type: inst.hook,
+        name: (inst.meta.name as string | undefined) ?? inst.logicalKey,
+        ...(inst.queue !== undefined ? { queue: inst.queue } : {}),
+        input: inst.input,
+        meta: inst.meta,
+        orderIndex: spec.tasks.findIndex((t) => t.id === inst.innerTaskId),
         groupIndex: gi,
+        dependsOnLogical: [...inst.dependsOnLogical],
+        innerTaskId: inst.innerTaskId,
+        isGroupEntry: entryIds.has(inst.innerTaskId),
+        isGroupExit: exitIds.has(inst.innerTaskId),
       });
     }
   }
@@ -192,15 +197,8 @@ export function createBuiltinRuntimeServices(
       groupCount,
       renderContext,
     ) {
-      const spec = (coordinatorConfig as CoordinatorConfig)
-        .taskGroupTemplateSpec;
-      if (!spec?.tasks?.length) {
-        throw new WorkflowValidationError(
-          `Coordinator template "${coordinatorConfig.taskGroupTemplate}" was not embedded at compile time. ` +
-            `Use compileFlow() so taskGroupTemplates are copied onto the node, or implement compileCoordinatorSubtasks in services.`,
-        );
-      }
-      return descriptorsFromTemplate(spec, groupCount, renderContext);
+      const spec = resolveEmbeddedGroupSpec(coordinatorConfig as CoordinatorConfig);
+      return descriptorsFromGroupSpec(spec, groupCount, renderContext);
     },
     async createCoordinatorSubtasks(params) {
       if (typeof store.appendTasks !== 'function') {
@@ -210,17 +208,44 @@ export function createBuiltinRuntimeServices(
       }
       const strategy = params.groupStrategy;
       const ids = params.tasks.map(() => createId());
+      const logicalToId = new Map<string, string>();
+      params.tasks.forEach((desc, index) => {
+        const id = ids[index];
+        if (id) logicalToId.set(desc.logicalId, id);
+      });
+
       const materialized: MaterializedTask[] = params.tasks.map((desc, index) => {
         const dependsOn: string[] = [];
+        for (const lk of desc.dependsOnLogical ?? []) {
+          const depId = logicalToId.get(lk);
+          if (depId) dependsOn.push(depId);
+        }
+
         if (strategy === 'sequential' && desc.groupIndex > 0) {
-          for (let i = 0; i < params.tasks.length; i++) {
-            const other = params.tasks[i];
-            if (other && other.groupIndex === desc.groupIndex - 1) {
-              const depId = ids[i];
-              if (depId) dependsOn.push(depId);
+          if (desc.isGroupEntry) {
+            for (let i = 0; i < params.tasks.length; i++) {
+              const other = params.tasks[i];
+              if (
+                other &&
+                other.groupIndex === desc.groupIndex - 1 &&
+                other.isGroupExit
+              ) {
+                const depId = ids[i];
+                if (depId) dependsOn.push(depId);
+              }
+            }
+          } else if (desc.isGroupEntry === undefined && desc.isGroupExit === undefined) {
+            // Legacy flat templates: entire previous group blocks this task.
+            for (let i = 0; i < params.tasks.length; i++) {
+              const other = params.tasks[i];
+              if (other && other.groupIndex === desc.groupIndex - 1) {
+                const depId = ids[i];
+                if (depId) dependsOn.push(depId);
+              }
             }
           }
         }
+
         const id = ids[index];
         if (!id) {
           throw new StoreProtocolError('Failed to allocate coordinator subtask id');
