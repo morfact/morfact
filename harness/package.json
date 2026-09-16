@@ -1,0 +1,38 @@
+{
+  "name": "@morfact/harness",
+  "version": "0.1.0",
+  "description": "Provider-neutral, event-first model and tool execution harness for Morfact applications",
+  "type": "module",
+  "private": false,
+  "license": "MIT",
+  "author": "Mozex Team",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mozex/morfact"
+  },
+  "keywords": ["morfact", "agent", "harness", "tools", "llm"],
+  "sideEffects": false,
+  "files": ["dist", "README.md"],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.ts",
+      "import": "./dist/testing.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepublishOnly": "pnpm run build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --config vitest.config.ts"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "vitest": "^3.0.5"
+  },
+  "engines": { "node": ">=20" },
+  "publishConfig": { "access": "public" }
+}
