@@ -1,0 +1,14 @@
+{
+  "name": "morfact",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@10.11.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "pnpm --filter @morfact/core build && pnpm --filter @morfact/harness build && pnpm --filter @morfact/memory build",
+    "typecheck": "pnpm --filter @morfact/core typecheck && pnpm --filter @morfact/harness typecheck && pnpm --filter @morfact/memory typecheck",
+    "test": "pnpm --filter @morfact/core test && pnpm --filter @morfact/harness test && pnpm --filter @morfact/memory test"
+  }
+}
