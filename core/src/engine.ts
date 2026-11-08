@@ -352,6 +352,7 @@ export function createEngine(options: EngineOptions): Engine {
           checkpoint: result.checkpoint,
           iteration: result.iteration,
           ...(result.output === undefined ? {} : { output: result.output }),
+          ...(result.delayMs === undefined ? {} : { delayMs: result.delayMs }),
           now: now(),
         });
         finalized = true;
@@ -441,6 +442,7 @@ export function createEngine(options: EngineOptions): Engine {
           (item) =>
             item.status !== 'succeeded' &&
             item.status !== 'skipped' &&
+            item.status !== 'failed' &&
             item.status !== 'cancelled',
         );
         if (siblings.length > 0 && unfinished.length === 0) {

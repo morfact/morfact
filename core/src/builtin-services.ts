@@ -207,14 +207,34 @@ export function createBuiltinRuntimeServices(
         );
       }
       const strategy = params.groupStrategy;
-      const ids = params.tasks.map(() => createId());
+      // Idempotent dispatch: a logical key already materialized under this
+      // coordinator (repeat dispatch, replayed commit) is never created again.
+      const existing = await store.listTasks(params.runId);
+      const existingLogicalKeys = new Set(
+        existing
+          .filter((t) => t.ancestorId === params.taskId)
+          .map((t) => t.logicalKey),
+      );
+      const pending = params.tasks.filter(
+        (desc) => !existingLogicalKeys.has(desc.logicalId),
+      );
+      if (pending.length === 0) {
+        return { createdCount: 0 };
+      }
+
+      const ids = pending.map(() => createId());
       const logicalToId = new Map<string, string>();
-      params.tasks.forEach((desc, index) => {
+      for (const task of existing) {
+        if (task.ancestorId === params.taskId) {
+          logicalToId.set(task.logicalKey, task.id);
+        }
+      }
+      pending.forEach((desc, index) => {
         const id = ids[index];
         if (id) logicalToId.set(desc.logicalId, id);
       });
 
-      const materialized: MaterializedTask[] = params.tasks.map((desc, index) => {
+      const materialized: MaterializedTask[] = pending.map((desc, index) => {
         const dependsOn: string[] = [];
         for (const lk of desc.dependsOnLogical ?? []) {
           const depId = logicalToId.get(lk);
@@ -222,27 +242,18 @@ export function createBuiltinRuntimeServices(
         }
 
         if (strategy === 'sequential' && desc.groupIndex > 0) {
-          if (desc.isGroupEntry) {
-            for (let i = 0; i < params.tasks.length; i++) {
-              const other = params.tasks[i];
-              if (
-                other &&
-                other.groupIndex === desc.groupIndex - 1 &&
-                other.isGroupExit
-              ) {
-                const depId = ids[i];
-                if (depId) dependsOn.push(depId);
-              }
-            }
-          } else if (desc.isGroupEntry === undefined && desc.isGroupExit === undefined) {
-            // Legacy flat templates: entire previous group blocks this task.
-            for (let i = 0; i < params.tasks.length; i++) {
-              const other = params.tasks[i];
-              if (other && other.groupIndex === desc.groupIndex - 1) {
-                const depId = ids[i];
-                if (depId) dependsOn.push(depId);
-              }
-            }
+          const previous = params.tasks.filter(
+            (other) => other.groupIndex === desc.groupIndex - 1,
+          );
+          const blockers =
+            desc.isGroupEntry === undefined && desc.isGroupExit === undefined
+              ? previous
+              : desc.isGroupEntry
+                ? previous.filter((other) => other.isGroupExit)
+                : [];
+          for (const blocker of blockers) {
+            const depId = logicalToId.get(blocker.logicalId);
+            if (depId) dependsOn.push(depId);
           }
         }
 
@@ -263,7 +274,7 @@ export function createBuiltinRuntimeServices(
         };
       });
       const result = await store.appendTasks({
-        commandId: createId(),
+        commandId: `coordinator:${params.taskId}:${pending.map((d) => d.logicalId).join(',')}`,
         runId: params.runId,
         coordinatorTaskId: params.taskId,
         tasks: materialized,
@@ -275,18 +286,27 @@ export function createBuiltinRuntimeServices(
       const tasks = await store.listTasks(runId);
       const subs = tasks.filter((t) => t.ancestorId === taskId);
       if (subs.length === 0) {
-        return { completed: false, totalCount: 0, unfinishedCount: 0 };
+        return {
+          completed: false,
+          totalCount: 0,
+          unfinishedCount: 0,
+          failedCount: 0,
+          cancelledCount: 0,
+        };
       }
       const unfinished = subs.filter(
         (t) =>
           t.status !== 'succeeded' &&
           t.status !== 'skipped' &&
+          t.status !== 'failed' &&
           t.status !== 'cancelled',
       );
       return {
         completed: unfinished.length === 0,
         totalCount: subs.length,
         unfinishedCount: unfinished.length,
+        failedCount: subs.filter((t) => t.status === 'failed').length,
+        cancelledCount: subs.filter((t) => t.status === 'cancelled').length,
       };
     },
   };

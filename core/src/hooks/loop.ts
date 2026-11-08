@@ -21,6 +21,13 @@ export interface LoopBodyOutput {
   readonly halt: boolean;
   readonly checkpoint?: unknown;
   readonly output?: unknown;
+  /**
+   * Delay before the next iteration may run. `nextRunAt` is an absolute time
+   * (Date or ISO string, evaluated against `ctx.now()`); `delayMs` is relative.
+   * `nextRunAt` wins when both are set.
+   */
+  readonly nextRunAt?: Date | string;
+  readonly delayMs?: number;
 }
 
 export interface LoopOutput {
@@ -78,7 +85,42 @@ function parseBodyOutput(output: unknown): LoopBodyOutput {
     halt: record.halt,
     ...('checkpoint' in record ? { checkpoint: record.checkpoint } : {}),
     ...('output' in record ? { output: record.output } : {}),
+    ...('nextRunAt' in record
+      ? { nextRunAt: record.nextRunAt as Date | string }
+      : {}),
+    ...('delayMs' in record ? { delayMs: record.delayMs as number } : {}),
   };
+}
+
+/**
+ * Delay before the next iteration may be claimed. `nextRunAt` wins over
+ * `delayMs`; a time already in the past yields no delay.
+ */
+export function resolveLoopDelayMs(
+  parsed: Pick<LoopBodyOutput, 'nextRunAt' | 'delayMs'>,
+  now: Date,
+): number | undefined {
+  if (parsed.nextRunAt !== undefined) {
+    const at =
+      parsed.nextRunAt instanceof Date
+        ? parsed.nextRunAt
+        : new Date(parsed.nextRunAt);
+    if (Number.isNaN(at.getTime())) {
+      throw new Error('Loop body nextRunAt is not a valid time');
+    }
+    const delta = at.getTime() - now.getTime();
+    return delta > 0 ? delta : undefined;
+  }
+  if (parsed.delayMs !== undefined) {
+    if (typeof parsed.delayMs !== 'number' || !Number.isFinite(parsed.delayMs)) {
+      throw new Error('Loop body delayMs must be a finite number');
+    }
+    if (parsed.delayMs < 0) {
+      throw new Error('Loop body delayMs must be >= 0');
+    }
+    return parsed.delayMs > 0 ? parsed.delayMs : undefined;
+  }
+  return undefined;
 }
 
 function bodyInput(
@@ -160,6 +202,7 @@ export function createLoopHook(
       }
 
       const nextIteration = runtime.iteration + 1;
+      const delayMs = resolveLoopDelayMs(parsed, ctx.now());
       const onMax = config.onMaxIterations ?? 'fail';
       if (nextIteration >= config.maxIterations) {
         if (onMax === 'succeed') {
@@ -183,6 +226,7 @@ export function createLoopHook(
         status: 'continue',
         checkpoint: parsed.checkpoint,
         iteration: nextIteration,
+        ...(delayMs !== undefined ? { delayMs } : {}),
         output: {
           truncated: false,
           iteration: runtime.iteration,

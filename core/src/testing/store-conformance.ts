@@ -810,6 +810,80 @@ export const storeConformanceCases: readonly StoreConformanceCase[] = [
     },
   },
   {
+    name: 'holds a continued task until its delay elapses, in task claim and outbox',
+    async run(createStore) {
+      const store = await createStore();
+      if (typeof store.commitTaskContinue !== 'function') {
+        return;
+      }
+      await store.createRun(
+        runCommand('continue-delay', [
+          {
+            id: 'conformance-task-delayed',
+            logicalKey: 'delayed',
+            hook: 'conformance.loop@1',
+            input: {},
+            dependsOn: [],
+            maxAttempts: 3,
+          },
+        ]),
+      );
+      const claim = await store.claimTask({
+        workerId: 'worker',
+        taskId: 'conformance-task-delayed',
+        now: new Date('2026-01-01T00:00:01.000Z'),
+        leaseExpiresAt: new Date('2026-01-01T00:01:01.000Z'),
+      });
+      assert(claim, 'task must be claimable');
+      await store.commitTaskContinue({
+        commandId: 'conformance-continue-delay',
+        taskId: claim.task.id,
+        leaseToken: claim.task.leaseToken,
+        checkpoint: { polls: 1 },
+        iteration: 1,
+        delayMs: 60_000,
+        now: new Date('2026-01-01T00:00:02.000Z'),
+      });
+
+      const delayed = await store.getTask('conformance-task-delayed');
+      assert(
+        delayed?.notBefore?.toISOString() === '2026-01-01T00:01:02.000Z',
+        'continue must persist notBefore so a restart keeps the delay',
+      );
+      const tooEarly = await store.claimTask({
+        workerId: 'worker',
+        taskId: 'conformance-task-delayed',
+        now: new Date('2026-01-01T00:00:30.000Z'),
+        leaseExpiresAt: new Date('2026-01-01T00:01:30.000Z'),
+      });
+      assert(tooEarly === null, 'a delayed task must not be claimable early');
+      const earlyOutbox = await store.claimOutbox({
+        workerId: 'dispatcher',
+        destination: 'workflow.tasks',
+        limit: 10,
+        now: new Date('2026-01-01T00:00:30.000Z'),
+        leaseExpiresAt: new Date('2026-01-01T00:01:30.000Z'),
+      });
+      assert(
+        earlyOutbox
+          .filter((event) => event.taskId === 'conformance-task-delayed')
+          .every(
+            (event) =>
+              event.availableAt.toISOString() === '2026-01-01T00:00:00.000Z',
+          ),
+        'the delayed outbox event must not be claimable early',
+      );
+
+      const onTime = await store.claimTask({
+        workerId: 'worker',
+        taskId: 'conformance-task-delayed',
+        now: new Date('2026-01-01T00:01:02.000Z'),
+        leaseExpiresAt: new Date('2026-01-01T00:02:02.000Z'),
+      });
+      assert(onTime, 'a delayed task must be claimable once notBefore passes');
+    },
+  },
+  {
     name: 'lists runs with filters and pagination',
     async run(createStore) {
       const store = await createStore();

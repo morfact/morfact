@@ -333,8 +333,9 @@ Runtime logical keys for `groupRef` fan-out: `{groupId}.{taskId}[{i}]`.
 
 **Group constraints**
 
-- Allowed inner types: `business`, `bridge`, `plan`, `input`, `merge`, `completed`
-- Forbidden inside groups: `coordinator`, `spawn`, `loop`, `gate`, `router`, `join`, nested `group`
+- Allowed inner types: `business`, `bridge`, `plan`, `input`, `merge`, `completed`, `loop`
+- Forbidden inside groups: `coordinator`, `spawn`, `gate`, `router`, `join`, nested `group`
+- An inner `loop` is a real `@morfact/core/loop` task (own `output`, `checkpoint`, iteration, retries). It needs `loop.body` and `maxIterations >= 1`; the engine must have the loop hook registered
 - Inner scheduling: `group.edges` (simple DAG), or `strategy: parallel | sequential` when no edges
 - Boundary: upstream → group connects to **entry** tasks; group → downstream waits for **exit** tasks (`exits` optional; defaults to terminal inner nodes)
 
@@ -445,15 +446,19 @@ YAML:
 The body hook receives `input.loop = { iteration, checkpoint }` and must return:
 
 ```ts
-{ halt: false, checkpoint, output? }  // next round; checkpoint is opaque to the engine
-{ halt: true, output?, checkpoint? }  // node completes
+{ halt: false, checkpoint, output?, delayMs?, nextRunAt? }  // next round
+{ halt: true, output?, checkpoint? }                        // node completes
 ```
+
+`delayMs` (relative) or `nextRunAt` (absolute `Date` or ISO string, measured against `ctx.now()`) postpones the next iteration. The store persists it as task `notBefore` and outbox `availableAt`; claim and outbox dispatch both honor it, including after a restart. A time already in the past means "run now". Do not sleep inside the hook.
 
 Throw retries the **same** iteration through existing `maxAttempts`. The next iteration starts only after `{ halt: false, checkpoint }`.
 
 `maxIterations` is a budget, not a correctness signal. Default `onMaxIterations: fail` is a fuse. Precision / agent flows that may legally stop at the cap should set `succeed`. Final output always includes `haltReason` (`halt` | `max_iterations`) and `truncated` when the cap was hit.
 
-This is not polling: each continue is a real commit of progress, the node stays incomplete, and the engine re-enqueues **the same task**. Do not reuse `completePollingTask`. Production stores must implement `commitTaskContinue` (re-queue, persist `meta.loopState`, do **not** unlock downstream).
+This is not an in-process poller: each continue is a real commit of progress, the node stays incomplete, and the engine re-enqueues **the same task**. Do not reuse `completePollingTask`. Production stores must implement `commitTaskContinue` (re-queue, persist `meta.loopState`, honor `delayMs` as `notBefore` / `availableAt`, do **not** unlock downstream).
+
+A coordinator can fan out one native loop per item when the count is only known at runtime (a picture book of N pages, one video loop each). Put `type: loop` inside the `group` the coordinator references — no `type: business` workaround. Each page gets a stable logical key `{groupId}.{taskId}[{i}]` and its own task, so a failure, retry, or cancellation on one page never redoes the others. Aggregation: the coordinator succeeds only when every subtask succeeded; any failed subtask fails it; a cancelled parent cancels its sub-loops and they stop being claimable.
 
 Body hook example (pagination). Register this hook on the same engine; `loop.body` is its `name`:
 
@@ -632,7 +637,7 @@ for (const testCase of storeConformanceCases) {
 |---|---|
 | 24 required methods | Run / Task / Outbox / Interaction |
 | `appendTasks?` | Required for `@morfact/core/coordinator`; missing it throws `StoreProtocolError` |
-| `commitTaskContinue?` | Required for `@morfact/core/loop`; re-queue the same task and persist checkpoint; must not unlock downstream |
+| `commitTaskContinue?` | Required for `@morfact/core/loop`; re-queue the same task, persist checkpoint, and honor `delayMs` (`notBefore` + outbox `availableAt`); must not unlock downstream |
 | `listRuns({ parentTaskId })` | Used by spawn to find an existing child run |
 
 For local/tests, use `new MemoryWorkflowStateStore()`. It already implements `appendTasks`, `commitTaskContinue`, parent/child runs, and merging `input` on resume.

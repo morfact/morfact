@@ -24,7 +24,8 @@ export type GroupInnerNodeType =
   | 'plan'
   | 'input'
   | 'merge'
-  | 'completed';
+  | 'completed'
+  | 'loop';
 
 export interface GroupInnerTask {
   id: string;
@@ -34,6 +35,8 @@ export interface GroupInnerTask {
   maxAttempts?: number;
   inputTemplate?: Record<string, unknown>;
   hooks?: FlowNodeDefinition['hooks'];
+  /** Required when `type` is `loop`. */
+  loop?: LoopConfig;
   meta?: Record<string, unknown>;
 }
 

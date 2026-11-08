@@ -58,7 +58,12 @@ export interface CoordinatorServices {
   createCoordinatorSubtasks(params: CoordinatorSubtaskCreateParams): Promise<{
     createdCount: number;
   }>;
-  /** Check if all subtasks under this coordinator are completed */
+  /**
+   * Summarize every subtask under this coordinator.
+   * Aggregation rule: `succeeded`/`skipped` count as done, `failed` fails the
+   * group, `cancelled` cancels it, anything else is still unfinished.
+   * `failed` wins over `cancelled` when both are present.
+   */
   areSubtaskGroupsCompleted(
     runId: string,
     taskId: string,
@@ -66,6 +71,8 @@ export interface CoordinatorServices {
     completed: boolean;
     totalCount: number;
     unfinishedCount: number;
+    failedCount: number;
+    cancelledCount: number;
   }>;
 }
 
@@ -73,7 +80,14 @@ export interface CoordinatorOutput {
   coordinatorWaiting?: boolean;
   groupCount?: number;
   totalTaskCount?: number;
-  status?: 'waiting_for_subtasks' | 'subtasks_completed';
+  succeededCount?: number;
+  failedCount?: number;
+  cancelledCount?: number;
+  status?:
+    | 'waiting_for_subtasks'
+    | 'subtasks_completed'
+    | 'subtasks_failed'
+    | 'subtasks_cancelled';
   message?: string;
   skipped?: boolean;
   reason?: string;
@@ -161,12 +175,28 @@ export const coordinatorHook: HookDefinition<
           resumeToken: `${RESUME_TOKEN_PREFIX}${ctx.task.id}`,
         };
       }
-      // All done
+      // Every subtask reached a terminal state. A single failure fails the
+      // coordinator; otherwise a cancellation cancels it; else it succeeds.
+      if (check.failedCount > 0) {
+        throw new Error(
+          `[Coordinator] ${check.failedCount} of ${check.totalCount} subtasks failed`,
+        );
+      }
+      if (check.cancelledCount > 0) {
+        // Parent cancellation already stopped the run; stay suspended so the
+        // coordinator is not recorded as a successful completion.
+        return {
+          status: 'waiting',
+          reason: 'child_run',
+          resumeToken: `${RESUME_TOKEN_PREFIX}${ctx.task.id}`,
+        };
+      }
       return {
         status: 'succeeded',
         output: {
           groupCount,
           totalTaskCount: check.totalCount,
+          succeededCount: check.totalCount,
           taskGroupTemplate: groupLabel,
           groupStrategy,
           status: 'subtasks_completed',

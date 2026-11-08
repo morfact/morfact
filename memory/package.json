@@ -1,6 +1,6 @@
 {
   "name": "@morfact/memory",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "In-memory WorkflowStateStore adapter for morfact workflow engine — zero-dependency test harness",
   "type": "module",
   "private": false,
@@ -35,10 +35,12 @@
     "test": "vitest run --config vitest.config.ts --passWithNoTests"
   },
   "peerDependencies": {
-    "@morfact/core": "^0.1.0"
+    "@morfact/core": "workspace:^"
   },
   "devDependencies": {
-    "@morfact/core": "^0.1.3",
+    "@morfact/core": "workspace:*",
+    "@types/pg": "^8.11.10",
+    "pg": "^8.13.0",
     "typescript": "^5.6.3",
     "vitest": "^3.0.5"
   },

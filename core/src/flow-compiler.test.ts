@@ -239,6 +239,55 @@ describe('compileFlow type: group', () => {
     ).toBe('act_plan');
   });
 
+  it('allows a loop inside a group and embeds its body config', () => {
+    const flow: FlowDefinition = {
+      apiVersion: 'flow.v1',
+      kind: 'Flow',
+      metadata: { name: 'group.loop', version: '1.0' },
+      spec: {
+        nodes: [
+          {
+            id: 'page_video',
+            type: 'group',
+            group: {
+              tasks: [
+                {
+                  id: 'render',
+                  type: 'loop',
+                  loop: {
+                    body: 'book.page_video@1',
+                    maxIterations: 20,
+                    onMaxIterations: 'fail',
+                  },
+                  inputTemplate: { page: '{{groupIndex}}' },
+                },
+              ],
+            },
+          },
+          {
+            id: 'pages',
+            type: 'coordinator',
+            coordinator: { groupRef: 'page_video', groupCount: '{{params.pageCount}}' },
+          },
+        ],
+      },
+    };
+    const compiled = compileFlow(
+      flow,
+      new Set(['@morfact/core/coordinator', '@morfact/core/loop', 'book.page_video@1']),
+      () => 'task-1',
+    );
+    const meta = (
+      compiled.tasks[0]?.input as {
+        _meta?: { coordinator?: { groupSpec?: { tasks: Array<{ type: string; loop?: { body: string } }> } } };
+      }
+    )._meta;
+    expect(meta?.coordinator?.groupSpec?.tasks[0]).toMatchObject({
+      type: 'loop',
+      loop: { body: 'book.page_video@1', maxIterations: 20 },
+    });
+  });
+
   it('rejects forbidden inner node types inside a group', () => {
     const flow: FlowDefinition = {
       apiVersion: 'flow.v1',

@@ -8,7 +8,6 @@ import { renderTemplate, type RenderContext } from './template-engine.js';
 export const FORBIDDEN_GROUP_INNER_TYPES = new Set([
   'coordinator',
   'spawn',
-  'loop',
   'gate',
   'router',
   'join',
@@ -107,6 +106,39 @@ export function validateGroupSpec(
     }
 
     if (task.type === 'completed') continue;
+
+    if (task.type === 'loop') {
+      if (!availableHooks.has('@morfact/core/loop')) {
+        throw new WorkflowValidationError(
+          `${label}: inner task '${task.id}' references missing hook: @morfact/core/loop`,
+        );
+      }
+      if (!task.loop?.body) {
+        throw new WorkflowValidationError(
+          `${label}: inner task '${task.id}': loop.body is required`,
+        );
+      }
+      if (task.loop.body === '@morfact/core/loop') {
+        throw new WorkflowValidationError(
+          `${label}: inner task '${task.id}' loop body must not be @morfact/core/loop`,
+        );
+      }
+      if (!availableHooks.has(task.loop.body)) {
+        throw new WorkflowValidationError(
+          `${label}: inner task '${task.id}' references missing loop body hook: ${task.loop.body}`,
+        );
+      }
+      if (
+        typeof task.loop.maxIterations !== 'number' ||
+        !Number.isFinite(task.loop.maxIterations) ||
+        task.loop.maxIterations < 1
+      ) {
+        throw new WorkflowValidationError(
+          `${label}: inner task '${task.id}': loop.maxIterations must be >= 1`,
+        );
+      }
+      continue;
+    }
 
     const hook =
       typeof task.hooks?.executor === 'string'
@@ -227,6 +259,7 @@ function logicalKeyFor(
 
 function resolveInnerHook(task: GroupInnerTask): string {
   if (task.type === 'completed') return '@morfact/core/completed';
+  if (task.type === 'loop') return '@morfact/core/loop';
   const hook =
     typeof task.hooks?.executor === 'string'
       ? task.hooks.executor
@@ -310,6 +343,7 @@ export function materializeGroupInstance(
         groupId: spec.id,
         logicalKey,
         name,
+        ...(task.loop !== undefined ? { loop: task.loop } : {}),
         ...(task.meta ?? {}),
         ...(groupIndex !== undefined ? { groupIndex } : {}),
         coordinatorSubtask: groupIndex !== undefined,

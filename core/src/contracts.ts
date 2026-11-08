@@ -59,6 +59,12 @@ export type HookExecutionResult<TOutput = unknown> =
       readonly iteration: number;
       /** Optional visible progress for this round. */
       readonly output?: unknown;
+      /**
+       * Delay before the same task may be claimed again. The Store writes the
+       * re-queue outbox event with `availableAt = now + delayMs` and must not
+       * hand the task out before then, so a restart keeps the delay.
+       */
+      readonly delayMs?: number;
     };
 
 export interface HookDefinition<
@@ -190,6 +196,11 @@ export interface TaskRun {
   readonly createdAt: Date;
   readonly updatedAt: Date;
   readonly queuedAt?: Date;
+  /**
+   * Earliest time the task may be claimed. Set by `commitTaskContinue` when a
+   * loop iteration delays its next round; must survive a restart.
+   */
+  readonly notBefore?: Date;
   readonly startedAt?: Date;
   readonly finishedAt?: Date;
   readonly completedAt?: Date;
@@ -290,6 +301,11 @@ export interface CommitTaskContinueCommand {
   readonly checkpoint: unknown;
   readonly iteration: number;
   readonly output?: unknown;
+  /**
+   * Delay before the same task may be claimed again. Stores must persist it
+   * (task `notBefore` + outbox `availableAt`) so it survives a restart.
+   */
+  readonly delayMs?: number;
   readonly now: Date;
 }
 
